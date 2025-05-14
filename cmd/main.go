@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"slices"
 	"time"
 
@@ -22,13 +23,13 @@ import (
 // frontend or the database
 // More on these "tags" like `bson:"_id,omitempty"`: https://go.dev/wiki/Well-known-struct-tags
 type BookStore struct {
-	MongoID     primitive.ObjectID `bson:"_id,omitempty"`
-	ID          string
-	BookName    string
-	BookAuthor  string
-	BookEdition string
-	BookPages   string
-	BookYear    string
+	MongoID     primitive.ObjectID `bson:"_id,omitempty" json:"mongo_id"`
+	ID          string             `bson:"id" json:"id"`
+	BookName    string             `bson:"title" json:"title"`
+	BookAuthor  string             `bson:"author" json:"author"`
+	BookEdition string             `bson:"edition" json:"edition"`
+	BookPages   string             `bson:"pages" json:"pages"`
+	BookYear    string             `bson:"year" json:"year"`
 }
 
 // Wraps the "Template" struct to associate a necessary method
@@ -156,25 +157,32 @@ func prepareData(client *mongo.Client, coll *mongo.Collection) {
 // it is not :D ), and then we convert it into an array of map. In Golang, you
 // define a map by writing map[<key type>]<value type>{<key>:<value>}.
 // interface{} is a special type in Golang, basically a wildcard...
-func findAllBooks(coll *mongo.Collection) []map[string]interface{} {
+func findAllBooks(coll *mongo.Collection) []BookStore {
 	cursor, err := coll.Find(context.TODO(), bson.D{{}})
 	var results []BookStore
 	if err = cursor.All(context.TODO(), &results); err != nil {
 		panic(err)
 	}
-
-	var ret []map[string]interface{}
-	for _, res := range results {
-		ret = append(ret, map[string]interface{}{
-			"ID":          res.MongoID.Hex(),
-			"BookName":    res.BookName,
-			"BookAuthor":  res.BookAuthor,
-			"BookEdition": res.BookEdition,
-			"BookPages":   res.BookPages,
-		})
+	return results
+}
+func findById(id string, coll *mongo.Collection) *BookStore {
+	c := coll.FindOne(context.TODO(), bson.D{{"id", id}})
+	var result BookStore
+	err := c.Decode(&result)
+	if err != nil {
+		return nil
 	}
+	return &result
+}
 
-	return ret
+func findByMongoId(mongoId primitive.ObjectID, coll *mongo.Collection) BookStore {
+	c := coll.FindOne(context.TODO(), bson.D{{"_id", mongoId}})
+	var result BookStore
+	err := c.Decode(&result)
+	if err != nil {
+		return BookStore{}
+	}
+	return result
 }
 
 func main() {
@@ -186,7 +194,12 @@ func main() {
 	defer cancel()
 
 	// TODO: make sure to pass the proper username, password, and port
-	client, err := mongo.Connect(ctx, options.Client().ApplyURI("mongodb://localhost:27017"))
+	var uri = "mongodb://"
+	if os.Getenv("CC_MONGO_USERNAME") != "" {
+		uri += os.Getenv("MONGO_USERNAME") + ":" + os.Getenv("CC_MONGO_PASSWORD") + "@"
+	}
+	uri += os.Getenv("CC_MONGO_HOST") + ":" + os.Getenv("CC_MONGO_PORT")
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
 
 	// This is another way to specify the call of a function. You can define inline
 	// functions (or anonymous functions, similar to the behavior in Python)
@@ -252,6 +265,62 @@ func main() {
 	e.GET("/api/books", func(c echo.Context) error {
 		books := findAllBooks(coll)
 		return c.JSON(http.StatusOK, books)
+	})
+
+	e.POST("/api/books", func(c echo.Context) error {
+		store := BookStore{}
+		if err := c.Bind(&store); err != nil {
+			return err
+		}
+
+		existing := findById(store.ID, coll)
+		if existing != nil {
+			return c.NoContent(http.StatusBadRequest)
+		}
+
+		cursor, err := coll.InsertOne(context.TODO(), store)
+		if err != nil {
+			return err
+		}
+
+		return c.JSON(http.StatusOK, findByMongoId(cursor.InsertedID.(primitive.ObjectID), coll))
+	})
+
+	e.PUT("/api/books/:id", func(c echo.Context) error {
+		id := c.Param("id")
+		println("update: " + id)
+		store := BookStore{}
+		if err := c.Bind(&store); err != nil {
+			return err
+		}
+
+		existing := findById(id, coll)
+		if existing == nil {
+			return c.NoContent(http.StatusNotFound)
+		}
+
+		_, err := coll.ReplaceOne(context.TODO(), bson.D{{"id", id}}, store)
+		if err != nil {
+			return err
+		}
+
+		return c.JSON(http.StatusOK, findByMongoId(existing.MongoID, coll))
+	})
+
+	e.DELETE("/api/books/:id", func(c echo.Context) error {
+		id := c.Param("id")
+
+		existing := findById(id, coll)
+		if existing == nil {
+			return c.NoContent(http.StatusNotFound)
+		}
+
+		_, err := coll.DeleteOne(context.TODO(), bson.D{{"id", id}})
+		if err != nil {
+			return err
+		}
+
+		return c.NoContent(http.StatusNoContent)
 	})
 
 	// We start the server and bind it to port 3030. For future references, this
